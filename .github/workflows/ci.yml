@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4          # download this repository onto the runner
-      - uses: astral-sh/setup-uv@v5        # provides the `uvx` command
+      - uses: astral-sh/setup-uv@v7        # provides the `uvx` command
       - run: uvx ruff check .              # rules live in pyproject.toml under [tool.ruff]
       - run: uvx ruff format --check .     # only CHECKS formatting; fix locally with `uvx ruff format .`
 
