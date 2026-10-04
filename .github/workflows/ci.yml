@@ -42,7 +42,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4          # download this repository onto the runner
+      - uses: actions/checkout@v7          # download this repository onto the runner
       - uses: astral-sh/setup-uv@v5        # provides the `uvx` command
       - run: uvx ruff check .              # rules live in pyproject.toml under [tool.ruff]
       - run: uvx ruff format --check .     # only CHECKS formatting; fix locally with `uvx ruff format .`
@@ -51,7 +51,7 @@ jobs:
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0                   # full history, so old commits are scanned too
       - uses: gitleaks/gitleaks-action@v2
@@ -92,7 +92,7 @@ jobs:
       PGDATABASE: ci_db
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"           # same as the Airflow image, so tests match production
@@ -119,7 +119,7 @@ jobs:
       DBT_USER: ci_user
       DBT_PASSWORD: ci_password
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
