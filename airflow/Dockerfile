@@ -2,7 +2,7 @@
 # Docker builds each instruction as a cached layer, so rarely-changing steps come first.
 
 # Official Airflow image (Python 3.11) as the base.
-FROM apache/airflow:2.8.0-python3.11
+FROM apache/airflow:3.3.2-python3.11
 
 # The base image runs as the unprivileged "airflow" user. Installing OS packages needs root.
 USER root
