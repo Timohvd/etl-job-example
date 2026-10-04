@@ -1,0 +1,22 @@
+[project]
+name = "end-to-end-elt"
+version = "0.1.0"
+description = "Dutch train data ELT pipeline: NS API, Postgres, dbt, Airflow. This file only configures developer tooling; runtime dependencies live in airflow/requirements.txt (the Airflow image)."
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff", "pytest", "responses"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["dbt_project", "airflow/logs", "*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["db_connection", "alerts", "scraping", "safe_errors", "dbt_cmd"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

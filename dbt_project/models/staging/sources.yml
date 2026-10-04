@@ -1,0 +1,42 @@
+version: 2
+
+# A "source" is a table dbt does NOT build itself: here the raw tables filled by the Airflow extract tasks.
+# Models read them with {{ source('raw', 'stations') }}, which gives dbt the lineage (raw -> staging -> marts)
+# and lets us test and freshness-check the raw data.
+sources:
+  - name: raw
+    description: Unchanged NS API data, loaded by Airflow. Each row is one API record as JSONB.
+    schema: raw
+    tables:
+      - name: stations
+        description: Daily snapshot of all NL stations (one row per station per day).
+        # Freshness compares now() with the newest ingested_at. The pipeline loads once a day, so data is
+        # normally up to ~24h old: warn after 30h (a run is late), error after 54h (a whole run was missed).
+        # `dbt source freshness` exits non-zero on error; the pipeline_monitor DAG runs it every 6 hours.
+        loaded_at_field: ingested_at
+        freshness:
+          warn_after: {count: 30, period: hour}
+          error_after: {count: 54, period: hour}
+        columns:
+          - name: record_key
+            description: sha256(endpoint|snapshot_date|station code); unique per station per day.
+            data_tests: [unique, not_null]
+          - name: business_key
+            data_tests: [not_null]
+          - name: payload
+            data_tests: [not_null]
+
+      - name: disruptions
+        description: Daily snapshot of active disruptions and maintenance (one row per disruption per day).
+        loaded_at_field: ingested_at
+        freshness:
+          warn_after: {count: 30, period: hour}
+          error_after: {count: 54, period: hour}
+        columns:
+          - name: record_key
+            description: sha256(endpoint|snapshot_date|disruption id); unique per disruption per day.
+            data_tests: [unique, not_null]
+          - name: business_key
+            data_tests: [not_null]
+          - name: payload
+            data_tests: [not_null]

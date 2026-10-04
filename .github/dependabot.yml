@@ -1,0 +1,16 @@
+# Dependabot opens pull requests when dependencies or base images have new versions, so security fixes
+# do not depend on you remembering to check.
+version: 2
+updates:
+  - package-ecosystem: github-actions   # the actions used in .github/workflows
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker           # base image in airflow/Dockerfile
+    directory: /airflow
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip              # airflow/requirements.txt
+    directory: /airflow
+    schedule:
+      interval: weekly

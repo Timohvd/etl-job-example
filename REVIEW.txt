@@ -1,0 +1,83 @@
+REVIEW - Status van de security- en designbevindingen (bijgewerkt 2026-10-04)
+=============================================================================
+
+Legenda:  [x] opgelost   [ ] nog open   (U) actie van de gebruiker nodig
+
+
+WAT IS OPGELOST (in de herbouw van het project)
+-----------------------------------------------
+
+Security
+  [x] S2  Poorten alleen op 127.0.0.1 (Postgres, Airflow, MailHog).
+  [x] S3  Rol per component (loader, dbt, reader, airflow); admin alleen voor bootstrap/migraties.
+          Geverifieerd: loader kan niet CREATE TABLE of production lezen; reader kan raw niet lezen; dbt kan
+          raw niet wijzigen; alleen de admin is superuser.
+  [x] S4  AIRFLOW_FERNET_KEY en AIRFLOW_SECRET_KEY staan vast in .env.
+  [x] S5  Nieuwe sterke willekeurige wachtwoorden (hex, veilig in connection-URLs).
+  [x] S6  safe_error(): alleen type + eerste regel in mails en in raw.ingestion_log.error; log_url wordt ge-escaped.
+  [x] S7  airflow-init controleert of de admin bestaat; andere fouten laten de stap falen (geen "|| true" meer).
+  [x] S8  CI: permissions: contents: read; gitleaks-job; dependabot voor actions, Docker en pip.
+  [x] S9  Images vastgepind (postgres:15.8, mailhog:v1.0.1, dbt 1.8.2, Airflow 2.8.0).
+  [x] S11 NS-key en database-credentials alleen in de scheduler; webserver en init hebben ze niet.
+
+Design
+  [x] D1  snapshot_date = ophaaldag (Europe/Amsterdam), niet logical_date; catchup=False. Getest.
+  [x] D2  Het wegschrijven van de foutlog kan de echte fout niet meer maskeren. Getest.
+  [x] D3  Versioned migraties (sql/migrations, checksum, 1x toegepast); de loader maakt geen tabellen meer.
+  [x] D4  dbt-taken hebben retries=0.
+  [x] D5  pipeline_monitor-DAG draait elke 6 uur "dbt source freshness" (warn 30 u, error 54 u).
+  [x] D6  fct_disruptions neemt waarden uit de laatste snapshot (geen willekeurige max()).
+  [x] D7  Staging = views, marts = tabellen (bewuste keuze).
+  [x] D8  Optionele dead man's switch (HEALTHCHECK_URL) bij elke geslaagde run.
+  [x] D9  Singular tests: volume van stations, coordinaten binnen Nederland, consistentie van storingsdagen.
+  [x] D10 not_null op sleutelkolommen in raw en staging; accepted_values voor storingstypes (warn).
+  [x] D12 Tijdzone expliciet Europe/Amsterdam. Getest (23:30 UTC valt op de volgende dag).
+  [x] D13 make backup / make restore (pg_dump / pg_restore).
+  [x] D14 Tests draaien op een aparte <db>_test database.
+  [x] D15 Dode code verwijderd (replace_partition, save_dataframe).
+  [x] D16 Een bron van waarheid voor runtime-dependencies (airflow/requirements.txt); pyproject.toml is alleen
+          tooling; root requirements.txt, het lege src/-pakket en de verouderde dlt-verwijzingen zijn weg.
+  [x] D17 pandas is verwijderd; DAG-parsing importeert het niet meer.
+  [x] Nieuw: lege storingslijst is geldig (allow_empty); stations leeg blijft een fout.
+
+Verwijderd: test.ipynb (bevatte de API-key), test.py (leeg), requirements.txt (root), src/, init.sql (vervangen
+door bootstrap + migraties), uv.lock-regel in .gitignore (lockfile hoort in git).
+
+
+NOG OPEN
+--------
+
+  [ ] S1 (U) HOOG  De NS-key staat in de GIT-GESCHIEDENIS (commit "etl done", via test.ipynb).
+      - Er is geen remote ingesteld, dus er is niets gepusht. Je kunt de geschiedenis nog lokaal repareren.
+      - Vernieuw de key in het NS-portal en trek de oude in (dat is hoe dan ook nodig: de key is ook in een
+        chatgesprek getoond). Zet de nieuwe key in .env.
+      - Verwijder de key uit de geschiedenis voor je ooit pusht, bijvoorbeeld met git filter-repo, of begin de
+        repository opnieuw vanaf de huidige staat. Een lokale commit met de key is nog steeds een lek zodra je pusht.
+      - .env bevat nog de OUDE key; vervang hem.
+
+  [ ] S10 LAAG  SMTP zonder TLS of authenticatie. Prima voor MailHog. Voor echte mail: STARTTLS aan en
+      inloggegevens via secrets.
+
+  [ ] D11 LAAG  Volledige dagelijkse snapshots van bijna-statische data (stations). Bewust gekozen voor
+      eenvoud. Bij groei: payload_hash gebruiken om alleen wijzigingen op te slaan (SCD type 2) en incrementele
+      dbt-modellen.
+
+  [ ] D18 LAAG  Airflow-metadata en data zitten in een Postgres-instance (wel in aparte databases met eigen
+      rollen). Scheid ze in productie.
+
+  [ ] Overig
+      - Er is geen secrets backend; Airflow Connections + Vault/Secrets Manager is de volgende stap als er meer
+        API's bijkomen.
+      - De CI-workflow is nog nooit op GitHub gedraaid; pas na de eerste push zichtbaar.
+      - Acties in CI zijn gepind op een tag, niet op een commit-hash (dependabot houdt ze actueel).
+      - Het departures-endpoint van NS gaf 502 bij deze key (waarschijnlijk niet in het abonnement).
+      - Optioneel: FastAPI + frontend op production (gebruik de rol "reader"); ML in airflow/scripts/ml/.
+      - ALERT_EMAIL staat lokaal op dev@example.com (MailHog); zet een echt adres bij echte SMTP.
+
+
+WAT TE DOEN BIJ HET STARTEN MET EEN LEGE DATABASE
+-------------------------------------------------
+
+  Het bootstrap-script en de migraties draaien automatisch bij "make up" op een leeg volume. De bestaande data uit
+  de oude opzet is bij deze herbouw weggegooid (alleen testsnapshots; de API vult ze opnieuw).
+  Een volume resetten (wist alles!):  docker compose down -v

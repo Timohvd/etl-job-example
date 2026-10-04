@@ -1,0 +1,170 @@
+# Defines every container of the project. Start everything with `make up` (= docker compose up -d).
+# ${VARIABLES} are filled in from the `.env` file (see .env.example).
+#
+# STARTUP ORDER (each arrow waits for the previous step to be healthy / finished successfully):
+#   postgres -> db-migrate (creates the tables) -> airflow-init (Airflow metadata + admin user)
+#            -> airflow-webserver, airflow-scheduler
+#
+# LEAST PRIVILEGE: every component connects to Postgres with its own role (created in sql/init/00_bootstrap.sh):
+#   loader  (Airflow tasks)  writes raw        dbt  (transformations)  reads raw, builds staging + production
+#   airflow (Airflow itself) its own database  admin (PG_ADMIN_*)      only bootstrap, migrations, maintenance
+# Secrets such as the NS API key are only given to the container that needs them (the scheduler runs the tasks).
+#
+# All published ports are bound to 127.0.0.1, so only this machine can reach them, not your network.
+
+# --- Shared by all Airflow containers. `x-` keys are ignored by Docker; `&name` lets services reuse a block. ---
+x-airflow-common: &airflow-common
+  build: ./airflow                  # image built from airflow/Dockerfile
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    db-migrate:
+      condition: service_completed_successfully
+  environment: &airflow-env
+    # Airflow settings: AIRFLOW__<SECTION>__<OPTION>
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor            # tasks run as processes next to the scheduler
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__LOGGING__WORKER_LOG_RETENTION_DAYS: "14"
+    # Encrypts stored connection passwords and signs web sessions. Fixed values, so restarts keep working.
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    # Email for alerts. MailHog locally; for real mail set host/port and enable TLS + credentials.
+    AIRFLOW__SMTP__SMTP_HOST: ${SMTP_HOST}
+    AIRFLOW__SMTP__SMTP_PORT: ${SMTP_PORT}
+    AIRFLOW__SMTP__SMTP_MAIL_FROM: ${SMTP_MAIL_FROM}
+    AIRFLOW__SMTP__SMTP_STARTTLS: "False"
+    AIRFLOW__SMTP__SMTP_SSL: "False"
+    PYTHONPATH: /opt/airflow/scripts                  # lets `import scraping...` and `import alerts` work
+    DBT_TARGET_PATH: /tmp/dbt_target                  # dbt build output stays out of your repo folder
+    DBT_LOG_PATH: /tmp/dbt_logs
+  # Folders from your computer mounted into the container: edit locally and the container sees the change.
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/scripts:/opt/airflow/scripts
+    - ./dbt_project:/opt/airflow/dbt_project
+    - ./tests:/opt/airflow/tests                      # so `make test` can run inside the container
+
+# --- Credentials for the pipeline itself. Only the scheduler gets these (it executes the tasks). ---
+x-pipeline-env: &pipeline-env
+  DB_USER: loader                                     # extract tasks: write access to schema raw only
+  DB_PASSWORD: ${LOADER_PASSWORD}
+  DB_NAME: ${DB_NAME}
+  DB_NAME_TEST: ${DB_NAME}_test                       # tests run against this separate database
+  DB_HOST: postgres                                   # the SERVICE name; containers reach each other by it
+  DB_PORT: "5432"
+  DBT_USER: dbt                                       # dbt tasks: read raw, build staging + production
+  DBT_PASSWORD: ${DBT_PASSWORD}
+  NS_API_KEY: ${NS_API_KEY}
+  ALERT_EMAIL: ${ALERT_EMAIL}
+  HEALTHCHECK_URL: ${HEALTHCHECK_URL:-}               # optional dead man's switch, see airflow/scripts/alerts.py
+
+services:
+  # --- The database. Reachable from DBeaver on 127.0.0.1:5432 (log in with the PG_ADMIN_* account). ---
+  postgres:
+    image: postgres:15.8
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_ADMIN_USER}                 # the admin account; the pipeline never uses it
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      # Passwords for the roles created by sql/init/00_bootstrap.sh
+      LOADER_PASSWORD: ${LOADER_PASSWORD}
+      DBT_PASSWORD: ${DBT_PASSWORD}
+      READER_PASSWORD: ${READER_PASSWORD}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"  # host:container, localhost only
+    volumes:
+      - postgres_data:/var/lib/postgresql/data        # keeps the data between restarts
+      - ./sql/init:/docker-entrypoint-initdb.d:ro     # bootstrap scripts, run once on first start
+    healthcheck:                                      # other services wait for this (depends_on)
+      test: ["CMD-SHELL", "pg_isready -U ${PG_ADMIN_USER} -d ${DB_NAME}"]
+      interval: 5s
+      retries: 10
+
+  # --- One-off: apply database migrations (sql/migrations/*.sql) to the data and test databases, then exit. ---
+  db-migrate:
+    image: postgres:15.8                              # same image: it ships psql
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${PG_ADMIN_USER}
+      PGPASSWORD: ${PG_ADMIN_PASSWORD}
+    volumes:
+      - ./sql:/sql:ro
+    command: ["bash", "/sql/migrate.sh", "${DB_NAME}", "${DB_NAME}_test"]
+
+  # --- One-off: migrate Airflow's own database and create the admin user once, then exit. ---
+  airflow-init:
+    <<: *airflow-common
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        if ! airflow users list | grep -qw admin; then
+          airflow users create --username admin --firstname Admin --lastname User \
+            --role Admin --email "$${ALERT_EMAIL:-admin@example.com}" --password "$${AIRFLOW_ADMIN_PASSWORD}"
+        fi
+    environment:
+      <<: *airflow-env
+      ALERT_EMAIL: ${ALERT_EMAIL}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+
+  # --- Airflow web interface: http://localhost:8080. It needs no database or API credentials. ---
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${AIRFLOW_HOST_PORT:-8080}:8080"
+
+  # --- Airflow scheduler: decides when DAGs run and executes their tasks (so it holds the credentials). ---
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: [*airflow-env, *pipeline-env]
+
+  # --- dbt for manual use (`make dbt-run`, `make dbt-test`). Not started by `make up`. ---
+  # The scheduled pipeline runs dbt inside the Airflow containers instead.
+  dbt-runner:
+    image: ghcr.io/dbt-labs/dbt-postgres:1.8.2
+    platform: linux/amd64             # no arm64 build exists (Apple Silicon runs it emulated)
+    profiles: ["tools"]               # only started when asked for explicitly
+    entrypoint: []                    # so `docker compose run dbt-runner dbt run` executes `dbt run`
+    working_dir: /usr/app
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME}
+      DBT_USER: dbt
+      DBT_PASSWORD: ${DBT_PASSWORD}
+      DBT_PROFILES_DIR: /usr/app
+    volumes:
+      - ./dbt_project:/usr/app
+
+  # --- Fake mail server for development: catches all alert emails. UI: http://localhost:8025 ---
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "127.0.0.1:8025:8025"
+
+# Named volume holding the Postgres data. `docker compose down -v` deletes it (and all data!).
+volumes:
+  postgres_data:

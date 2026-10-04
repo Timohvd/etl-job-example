@@ -1,0 +1,271 @@
+WORKFLOW - Hoe dit project werkt en waarom (om van te leren)
+==============================================================
+
+Dit project is een voorbeeld van hoe je een batch-pijplijn ontwerpt zoals een ervaren data engineer dat doet.
+Deel A legt uit WAT er gebeurt. Deel B legt uit WAAROM, per ontwerpkeuze: dat is het deel om te onthouden
+en bij je volgende project te hergebruiken.
+
+
+DEEL A - WAT GEBEURT ER
+=======================
+
+1. HET GROTE PLAATJE
+--------------------
+
+  NS API
+    |  (1) Extract + Load: Python haalt JSON op           airflow/scripts/scraping/
+    v
+  raw.*          onbewerkte JSON in Postgres
+    |  (2) Transform: dbt "staging" (views)               dbt_project/models/staging/
+    v
+  staging.*      nette kolommen, 1 model per bron
+    |  (3) Transform: dbt "marts" (tabellen)              dbt_project/models/marts/
+    v
+  production.*   dim_station, fct_disruptions, mart_disruptions_daily
+
+Twee DAGs in Airflow:
+  elt_pipeline      dagelijks: ophalen, laden, transformeren, testen
+  pipeline_monitor  elke 6 uur: controleert of de data niet verouderd is
+
+Dit is ELT, geen ETL: eerst LADEN we de ruwe data, daarna transformeren we in de database. raw bevat altijd
+exact wat de API gaf, dus je kunt alle transformaties opnieuw draaien zonder de API nog eens aan te roepen.
+
+
+2. OPSTARTEN (volgorde in docker-compose.yml)
+---------------------------------------------
+
+  postgres  ->  eerste keer: sql/init/00_bootstrap.sh maakt rollen, databases, schema's en rechten
+            ->  db-migrate: sql/migrate.sh past sql/migrations/*.sql toe (maakt de raw-tabellen)
+            ->  airflow-init: Airflow-database + admin-gebruiker
+            ->  airflow-webserver en airflow-scheduler
+
+Elke stap wacht tot de vorige klaar is. Daardoor start niets op een half-gebouwde database.
+
+
+3. EEN RUN, STAP VOOR STAP
+--------------------------
+
+  extract_stations  --+
+                      +--> dbt_build_staging --> dbt_build_marts
+  extract_disruptions-+
+
+Stap 1  extract_stations en extract_disruptions (parallel)
+  - NSClient (ns_client.py): HTTP met API-key, timeout en retries bij 429/5xx.
+  - raw_loader.load_snapshot() zet de records in raw.<endpoint>, in EEN transactie:
+      1. de partitie van vandaag (snapshot_date) verwijderen
+      2. de nieuwe rijen invoegen (met business_key, record_key, payload_hash, volledige JSON)
+      3. een logregel in raw.ingestion_log schrijven
+  - Bij een fout: alles terugdraaien, een korte foutregel loggen, de fout opnieuw gooien.
+  - Lege API-uitvoer: voor stations is dat een FOUT (Nederland heeft altijd stations); voor storingen is het
+    GELDIG (een rustige dag), dus dan wordt de dag leeggemaakt en 0 rijen gelogd.
+
+Stap 2  dbt_build_staging
+  - "dbt build" draait modellen EN tests, in volgorde van afhankelijkheid.
+  - stg_stations: JSON uitpakken, types goed, laatste snapshot per station.
+  - stg_disruptions: idem, maar met alle dagen (historie).
+  - Singular test: aantal stations tussen 300 en 1500; coordinaten binnen Nederland.
+  - Faalt een test, dan faalt de taak en wordt alles daarna overgeslagen.
+
+Stap 3  dbt_build_marts
+  - dim_station: een rij per station.
+  - fct_disruptions: een rij per storing, eerste/laatste dag gezien, waarden uit de laatste snapshot.
+  - mart_disruptions_daily: aantal actieve storingen per dag en type.
+
+Stap 4  Afronding
+  - Succes: samenvattingsmail met aantal rijen per endpoint + ping naar HEALTHCHECK_URL (indien ingesteld).
+  - Fout na alle retries: foutmail met taak, run, korte foutmelding en link naar de log.
+
+
+4. WAT GEBEURT ER BIJ FOUTEN?
+-----------------------------
+
+  Korte netwerkfout              NSClient probeert tot 3x opnieuw
+  API blijft falen               Airflow herhaalt de extract-taak 3x (2, 4, 8 min, ...), dan een foutmail
+  Lege respons (stations)        taak faalt, niets wordt overschreven
+  Dubbele sleutel in snapshot    unieke index faalt, transactie rolt terug, oude data blijft staan
+  dbt-test faalt                 taak faalt METEEN (geen retries), marts worden niet gebouwd
+  Database onbereikbaar          de echte fout komt bij Airflow aan; het wegschrijven van de foutlog mag
+                                 mislukken zonder de oorzaak te verbergen
+  Taak hangt                     timeout na 10 min (taak) of 1 uur (hele run)
+  Twee runs tegelijk             voorkomen door max_active_runs=1
+  Pijplijn draait niet meer      pipeline_monitor (data te oud) en de externe healthcheck (pings blijven uit)
+
+
+5. BESTANDEN
+------------
+
+  docker-compose.yml                  Alle services, volgorde, rechten per component
+  .env / .env.example                 Geheimen en instellingen (.env nooit committen)
+  sql/init/00_bootstrap.sh            Rollen, databases, schema's, rechten (1x, bij lege database)
+  sql/migrations/0001_raw_tables.sql  Tabellen van de raw-laag
+  sql/migrate.sh                      Migratie-runner (1x toepassen, checksum-controle)
+  airflow/dags/elt_pipeline.py        De dagelijkse DAG
+  airflow/dags/pipeline_monitor.py    De monitoring-DAG
+  airflow/scripts/
+      db_connection.py                Alle database-toegang
+      alerts.py                       Mails en dead man's switch
+      safe_errors.py                  Foutteksten inkorten
+      dbt_cmd.py                      dbt-commando's bouwen
+      scraping/ns_client.py           HTTP-client voor de NS API
+      scraping/raw_loader.py          Generieke load naar raw.<endpoint>
+      scraping/extract_ns.py          Per endpoint: tabel, sleutel, allow_empty
+  dbt_project/                        sources, staging, marts, tests (singular tests in tests/)
+  tests/                              pytest
+  .github/workflows/ci.yml            Automatische controles (zie sectie 7)
+
+
+6. ZELF BEKIJKEN EN DEBUGGEN
+----------------------------
+
+  Stack starten          make up                    Airflow: http://localhost:8080   Mails: http://localhost:8025
+  Database openen        DBeaver op 127.0.0.1:5432, database project_db, gebruiker PG_ADMIN_USER
+
+  Is er data geladen?
+    SELECT endpoint, status, rows_loaded, error, snapshot_date
+    FROM raw.ingestion_log ORDER BY id DESC LIMIT 10;
+
+  Hoeveel rijen per dag?
+    SELECT snapshot_date, count(*) FROM raw.stations GROUP BY 1 ORDER BY 1;
+
+  Zijn er dubbelen? (hoort 0 rijen te geven)
+    SELECT record_key, count(*) FROM raw.stations GROUP BY 1 HAVING count(*) > 1;
+
+  Veranderde een station tussen twee dagen?
+    SELECT business_key FROM raw.stations GROUP BY 1 HAVING count(DISTINCT payload_hash) > 1;
+
+  Welke migraties zijn toegepast?
+    SELECT * FROM public.schema_migrations;
+
+  Commando's:   make test | make lint | make migrate | make backup | make dbt-test | make dbt-freshness
+
+
+DEEL B - WAAROM: ONTWERPPRINCIPES
+=================================
+
+Per principe: de regel, wat er in dit project mee gebeurt, en wat er zonder misgaat.
+
+P1  BEWAAR EERST ALLES ONGEWIJZIGD (ELT, raw als bron van waarheid)
+    Hier: raw.* bevat de volledige JSON per record. Parsen en typen gebeurt pas in dbt.
+    Zonder: je ontdekt een fout in je parsing en de oorspronkelijke data is weg. Nu draai je dbt opnieuw.
+
+P2  MAAK ELKE LOAD IDEMPOTENT
+    Hier: partitie verwijderen + invoegen in 1 transactie.
+    Zonder: elke herhaalde run (retry, handmatige run) verdubbelt je data.
+    Test jezelf: kun je dezelfde taak 5x draaien met hetzelfde resultaat?
+
+P3  ALLES OF NIETS (transacties)
+    Hier: delete + insert + log in 1 transactie; bij een fout rolt alles terug.
+    Zonder: een mislukte load laat een halflege tabel achter.
+
+P4  DWING CORRECTHEID AF IN DE DATABASE, NIET ALLEEN IN CODE
+    Hier: unieke index op record_key, CHECK op status, NOT NULL overal.
+    Zonder: een bug in je code schrijft stilletjes slechte data. De database is de laatste verdedigingslinie.
+
+P5  LABEL DATA MET WAT ZE WERKELIJK IS
+    Hier: snapshot_date = de dag waarop is OPGEHAALD, niet Airflow's logical_date. De API kent alleen "nu".
+    Zonder: een backfill labelt de data van vandaag als "vorige maand" en je historie liegt zonder fout.
+    Les: logical_date zegt wanneer de scheduler denkt dat de run hoort; het zegt niets over de data.
+    Gebruik de echte tijdzone (Europe/Amsterdam) voor "welke dag is het".
+
+P6  FAAL LUID BIJ WAT NIET KLOPT, MAAR ONDERSCHEID "LEEG" VAN "KAPOT"
+    Hier: 0 stations = fout; 0 storingen = geldig (allow_empty).
+    Zonder: of je wist een dag door een kapotte API, of je krijgt valse alarmen op rustige dagen.
+    Vraag per bron: wat is een plausibel aantal, en is nul ooit normaal?
+
+P7  RETRY ALLEEN WAT TIJDELIJK IS
+    Hier: extract = 3 retries met exponential backoff; dbt-tests = geen retries.
+    Zonder: je wacht 14 minuten op een alert voor een fout die nooit vanzelf verdwijnt.
+
+P8  SCHEMA'S BEHEER JE MET MIGRATIES, NIET MET "CREATE TABLE IF NOT EXISTS" IN JE CODE
+    Hier: genummerde SQL-bestanden, 1x toegepast, met checksum; de loader maakt geen tabellen.
+    Zonder: je weet nooit in welke staat een database is, en twee processen kunnen elkaar in de weg zitten.
+    Regel: een toegepaste migratie wijzig je NOOIT; je voegt een nieuwe toe.
+
+P9  LEAST PRIVILEGE (minste rechten)
+    Hier: loader schrijft alleen raw, dbt leest raw en bouwt staging/production, reader leest alleen production,
+    de admin wordt alleen voor bootstrap/migraties gebruikt.
+    Zonder: een lekkend wachtwoord of een bug geeft toegang tot alles, ook tot verwijderen.
+    Hetzelfde voor geheimen: de NS-key staat alleen in de container die hem gebruikt.
+
+P10 GEHEIMEN NOOIT IN CODE, LOGS OF MAILS
+    Hier: .env (gitignored), gitleaks in CI, safe_error() knipt foutteksten af tot type + eerste regel.
+    Zonder: database-fouten bevatten SQL en parameters (dus API-data) en belanden in je inbox en logboek.
+
+P11 TEST OP VERSCHILLENDE NIVEAUS
+    Data-tests (dbt): unique/not_null per kolom; singular tests voor volume en plausibiliteit; freshness.
+    Code-tests (pytest): gedrag, inclusief foutpaden (rollback, lege respons, falende log).
+    Structuurtests: DAG importeert, taken, afhankelijkheden, retries.
+    Tests draaien op een aparte database, zodat ze nooit echte data raken.
+    Les: generieke tests missen "3 stations in plaats van 400"; daar heb je een volumetest voor nodig.
+
+P12 MONITOR OOK HET ONTBREKEN VAN EEN RUN
+    Hier: pipeline_monitor controleert de versheid van de data; HEALTHCHECK_URL laat een extern systeem alarm
+    slaan als de pings stoppen.
+    Zonder: als de scheduler uitvalt faalt er niets, dus er komt ook geen foutmail. Stilte is geen succes.
+
+P13 MAAK DE PIJPLIJN TRACEERBAAR
+    Hier: run_id, fetched_at, ingested_at op elke rij; raw.ingestion_log voor elke poging;
+    record_key en payload_hash om rijen en wijzigingen te herkennen.
+    Zonder: "waar komt deze rij vandaan?" kost uren in plaats van een query.
+
+P14 SCHEID VERANTWOORDELIJKHEDEN
+    client (praat met de API) / loader (schrijft naar raw) / extract-functie (kent tabel en sleutel) / DAG (volgorde)
+    / dbt (betekenis van de data). Een nieuw endpoint raakt kleine, voorspelbare plekken.
+
+P15 KIES WAT SIMPEL BLIJFT, BEWUST
+    Staging = views (altijd actueel, geen opslag), marts = tabellen (snel en stabiel).
+    Volledige dagelijkse snapshots zijn goed genoeg op dit volume; bij groei gebruik je payload_hash om alleen
+    wijzigingen op te slaan (SCD type 2) en incrementele dbt-modellen.
+    Een senior bouwt wat het probleem nu nodig heeft en schrijft op wat later moet (zie REVIEW.txt).
+
+P16 DE OMGEVING IS REPRODUCEERBAAR
+    Hier: Docker Compose met vastgepinde images, health checks en opstartvolgorde; dependabot voor updates;
+    CI die dezelfde migraties toepast als productie; backup en restore via make.
+    Zonder: "het werkt op mijn machine".
+
+
+7. GITHUB ACTIONS (CI)
+----------------------
+
+  Wat: .github/workflows/ci.yml vertelt GitHub: "voer bij elke push deze controles uit op een schone computer".
+  Je krijgt een groen vinkje of rood kruisje; er wordt niets uitgerold.
+
+  Begrippen:  workflow = het bestand;  job = stappen op een eigen virtuele machine (jobs draaien parallel en
+              delen niets);  step = een commando of kant-en-klare actie;  runner = de machine van GitHub.
+
+  Onze jobs:
+    lint     ruff: ongebruikte imports, fouten, formattering
+    secrets  gitleaks: zoekt wachtwoorden en API-keys in code EN git-historie
+    test     pytest tegen een tijdelijke Postgres, nadat de echte migraties zijn toegepast
+    dbt      "dbt parse": is het dbt-project geldig?
+
+  Resultaten: GitHub -> tabblad "Actions" -> een run -> een job.
+  Lokaal hetzelfde:  make lint  en  make test.
+  De wachtwoorden in ci.yml zijn dummywaarden voor een database die alleen tijdens de run bestaat.
+
+
+8. EEN NIEUW ENDPOINT TOEVOEGEN
+-------------------------------
+
+  1. ns_client.py: methode die de lijst met records teruggeeft.
+  2. sql/migrations/000N_<naam>.sql: maak raw.<naam> (zelfde vorm als raw.stations); draai make migrate.
+  3. extract_ns.py: functie met tabel, sleutelveld en (indien nodig) allow_empty=True.
+  4. elt_pipeline.py: nieuwe @task, vóór dbt_build_staging.
+  5. dbt: sources.yml, stg_-model met tests, eventueel een mart; denk aan een volume- of plausibiliteitstest.
+  6. tests/: mock-test voor de client.
+
+  Een andere API met een eigen key: zet de key in .env en .env.example, geef hem in docker-compose.yml alleen
+  aan de scheduler (x-pipeline-env), schrijf een eigen client (eigen auth, timeouts, rate limits), hergebruik
+  load_snapshot(). Op termijn: Airflow Connections met een secrets backend.
+
+
+9. OEFENVRAGEN
+--------------
+
+  - Wat gebeurt er als je een run twee keer start op dezelfde dag? Waarom is dat veilig? (P2, P3)
+  - De API geeft morgen 3 stations. Welke controle slaat aan, en welke niet? (P6, P11)
+  - Waarom kunnen we een backfill niet gewoon "terugdraaien" voor deze API? (P5)
+  - Wat gebeurt er als het wachtwoord van de loader lekt? En dat van een admin? (P9)
+  - Hoe merk je dat de scheduler al twee dagen uit staat? (P12)
+  - Waarom staat de NS-key niet in de webserver-container? (P9, P10)
+  - Voeg een derde endpoint toe en kijk welke bestanden je raakt. Is dat er weinig? (P14)

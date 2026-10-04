@@ -1,0 +1,51 @@
+version: 2
+
+# Documentation and tests for staging models. Tests listed under `data_tests` run on `dbt test`
+# and `dbt build`. Each test is a query that must return zero rows, otherwise it fails.
+models:
+  - name: stg_stations
+    description: >
+      One row per NS station: the latest daily snapshot, with the raw JSON unpacked into typed columns.
+    columns:
+      - name: record_key
+        description: Unique row identifier carried over from raw (sha256 of endpoint, date and station code).
+        data_tests: [unique, not_null]
+      - name: station_code
+        description: Short NS station code, e.g. UT for Utrecht Centraal. The business key.
+        data_tests: [unique, not_null]
+      - name: eva_code
+        description: International EVA station number.
+      - name: uic_code
+        description: International UIC station number.
+      - name: station_name
+        description: Full station name.
+        data_tests: [not_null]
+      - name: station_name_short
+        description: Short station name.
+      - name: country_code
+        description: ISO country code. Only NL is requested from the API.
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ['NL']
+      - name: station_type
+        description: NS station category, e.g. MEGA_STATION or FACULTATIEF_STATION.
+      - name: latitude
+        description: Latitude in decimal degrees.
+      - name: longitude
+        description: Longitude in decimal degrees.
+      - name: has_departure_times
+        description: Whether NS publishes departure times for this station.
+      - name: has_facilities
+        description: Whether the station has facilities.
+      - name: effective_date
+        description: Date from which this station record is valid.
+      - name: snapshot_date
+        description: Day the data was fetched (Europe/Amsterdam); the snapshot this row comes from.
+        data_tests: [not_null]
+      - name: fetched_at
+        description: Exact moment the API was called.
+      - name: run_id
+        description: Airflow run that loaded the raw row; use it to trace problems.
+      - name: payload_hash
+        description: sha256 of the raw JSON; changes when the station's content changes.

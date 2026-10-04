@@ -1,0 +1,129 @@
+# =====================================================================================
+# CI (Continuous Integration) with GitHub Actions
+# =====================================================================================
+#
+# WHAT IS THIS?
+#   GitHub runs every workflow file in `.github/workflows/` on its own servers ("runners"). This one checks the
+#   code on every push, so mistakes are found within minutes instead of when the pipeline breaks at night.
+#   Nothing is deployed; you only get a green check or red cross on the commit / pull request.
+#
+# HOW IS IT BUILT?
+#   workflow = this file (a name, a trigger `on`, and jobs)
+#   job      = steps that run on one fresh virtual machine. Jobs run IN PARALLEL and share nothing, so each one
+#              checks out the code and installs what it needs.
+#   step     = one command (`run:`) or one ready-made action (`uses:`). A failing step fails the job.
+#
+# THE JOBS
+#   lint     ruff: unused imports, mistakes, formatting
+#   secrets  gitleaks: scans the code AND git history for committed secrets (API keys, passwords)
+#   test     pytest against a temporary Postgres, after applying the real migrations
+#   dbt      `dbt parse`: checks the dbt project is valid (SQL, refs, sources, tests)
+#
+# RUN THE SAME CHECKS LOCALLY:  make lint   |   make test
+# WHERE TO SEE RESULTS:         GitHub repository -> "Actions" tab -> a run -> a job.
+#
+# SECRETS: every value below is a dummy for a throwaway database that exists only during the run. Never put real
+#   secrets in this file (it is committed). The tests mock the NS API, so no real key is needed.
+# =====================================================================================
+
+name: CI
+
+# TRIGGER: every push to any branch and every pull request.
+on:
+  push:
+  pull_request:
+
+# LEAST PRIVILEGE: the automatic GITHUB_TOKEN may only read the repository.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4          # download this repository onto the runner
+      - uses: astral-sh/setup-uv@v5        # provides the `uvx` command
+      - run: uvx ruff check .              # rules live in pyproject.toml under [tool.ruff]
+      - run: uvx ruff format --check .     # only CHECKS formatting; fix locally with `uvx ruff format .`
+
+  # ---------------------------------------------------------------------------------
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                   # full history, so old commits are scanned too
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+
+    # A "service container": GitHub starts a real Postgres next to the job and removes it afterwards. The loader
+    # tests need a database to prove that rollbacks and duplicate protection really work.
+    services:
+      postgres:
+        image: postgres:15.8
+        env:
+          POSTGRES_USER: ci_user
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: ci_db
+        ports: ["5432:5432"]               # reachable as localhost:5432 from the job
+        options: >-
+          --health-cmd "pg_isready -U ci_user -d ci_db"
+          --health-interval 5s
+          --health-retries 10
+
+    # Environment for every step. The code reads its database settings from these, like it does in Docker.
+    env:
+      DB_USER: ci_user
+      DB_PASSWORD: ci_password
+      DB_NAME: ci_db
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      # libpq (psql) variables used by sql/migrate.sh; PGDATABASE is needed because psql otherwise
+      # tries a database named after the user.
+      PGHOST: localhost
+      PGUSER: ci_user
+      PGPASSWORD: ci_password
+      PGDATABASE: ci_db
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"           # same as the Airflow image, so tests match production
+      # Airflow has hundreds of dependencies that must match exactly; the official "constraints" file pins a
+      # compatible set. Without it pip may pick versions that break.
+      - name: Install dependencies (Airflow pinned with its constraints file)
+        run: |
+          pip install "apache-airflow==2.8.0" -r airflow/requirements.txt pytest responses \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.8.0/constraints-3.11.txt"
+      # Build the schema with the REAL migrations, the same way docker-compose does. This also tests the migrations.
+      - name: Apply migrations
+        run: |
+          psql -c "CREATE SCHEMA raw; CREATE SCHEMA staging; CREATE SCHEMA production;"
+          bash sql/migrate.sh ci_db
+      - run: python -m pytest tests -v
+
+  # ---------------------------------------------------------------------------------
+  dbt:
+    runs-on: ubuntu-latest
+    # profiles.yml reads these through env_var(...). `dbt parse` does not connect, but the profile must be complete.
+    env:
+      DB_NAME: ci_db
+      DB_HOST: localhost
+      DBT_USER: ci_user
+      DBT_PASSWORD: ci_password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install dbt-core==1.8.3 dbt-postgres==1.8.2     # same versions as airflow/Dockerfile
+      # Reads every model, source and test; fails on broken SQL templating, unknown refs/sources or bad test config.
+      - name: Parse dbt project
+        run: dbt parse --project-dir dbt_project --profiles-dir dbt_project

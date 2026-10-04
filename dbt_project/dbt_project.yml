@@ -1,0 +1,34 @@
+# Main dbt configuration. dbt reads the models in `models/` and builds them as described here.
+config-version: 2
+
+name: 'elt_project'
+version: '1.0.0'
+
+# Which entry in profiles.yml (database connection) this project uses.
+profile: 'elt_project'
+
+model-paths: ["models"]
+analysis-paths: ["analysis"]
+test-paths: ["tests"]       # singular tests: custom SQL checks; generic tests live next to the models
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+# Build output and downloaded packages; safe to delete, recreated automatically.
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Per-folder defaults. `+` marks dbt configs (not folder names). Schema names are used literally thanks to
+# macros/generate_schema_name.sql.
+models:
+  elt_project:
+    staging:
+      # Views: staging is cheap cleanup logic with no stored copy, so it always reflects raw. Marts are tables
+      # so readers get fast, stable results.
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: table
+      +schema: production

@@ -1,0 +1,42 @@
+version: 2
+
+models:
+  - name: stg_disruptions
+    description: >
+      NS disruptions and planned maintenance, one row per disruption per snapshot day.
+      History is kept (not deduplicated) so the marts can see how long a disruption lasted.
+    columns:
+      - name: record_key
+        description: Unique row identifier carried over from raw (sha256 of endpoint, date and disruption id).
+        data_tests: [unique, not_null]
+      - name: disruption_id
+        description: NS identifier (UUID) of the disruption; the same id appears on every day it is active.
+        data_tests: [not_null]
+      - name: disruption_type
+        description: Category from the API, e.g. MAINTENANCE or CALAMITY.
+        data_tests:
+          - not_null
+          # Warn (not fail) so a new category introduced by NS does not stop the pipeline.
+          - accepted_values:
+              values: ['MAINTENANCE', 'CALAMITY', 'DISRUPTION', 'EVENT']
+              config:
+                severity: warn
+      - name: title
+        description: Short headline of the disruption.
+      - name: priority
+        description: NS priority, PRIO_1 (most severe) to PRIO_3.
+      - name: is_active
+        description: Whether NS marked the disruption as active in that snapshot.
+      - name: last_updated_at
+        description: When NS last updated the disruption.
+      - name: url
+        description: Link to the NS page about the disruption.
+      - name: snapshot_date
+        description: Day the data was fetched (Europe/Amsterdam); the snapshot this row comes from.
+        data_tests: [not_null]
+      - name: fetched_at
+        description: Exact moment the API was called.
+      - name: run_id
+        description: Airflow run that loaded the raw row.
+      - name: payload_hash
+        description: sha256 of the raw JSON; changes when the disruption's content changes.

@@ -1,0 +1,46 @@
+version: 2
+
+# Marts: tables meant to be read by analysts, dashboards or an API.
+# Naming: dim_ = descriptive entities, fct_ = events/facts, mart_ = pre-aggregated reporting tables.
+models:
+  - name: dim_station
+    description: One row per Dutch station (latest snapshot). The dimension to join facts to.
+    columns:
+      - name: station_code
+        description: Short NS station code; the primary key.
+        data_tests: [unique, not_null]
+      - name: station_name
+        description: Full station name.
+        data_tests: [not_null]
+      - name: last_seen_date
+        description: Most recent snapshot day this station was present.
+
+  - name: fct_disruptions
+    description: One row per NS disruption across all snapshots, with when it was first and last seen.
+    columns:
+      - name: disruption_id
+        description: NS identifier of the disruption; the primary key.
+        data_tests: [unique, not_null]
+      - name: first_seen_date
+        description: First snapshot day the disruption appeared in.
+      - name: last_seen_date
+        description: Last snapshot day the disruption appeared in.
+      - name: days_observed
+        description: Number of snapshot days the disruption was present.
+        data_tests: [not_null]
+      - name: is_currently_active
+        description: True if the disruption is active in the most recent snapshot.
+
+  - name: mart_disruptions_daily
+    description: Number of active disruptions per snapshot day and disruption type.
+    columns:
+      - name: snapshot_date
+        description: The snapshot day.
+        data_tests: [not_null]
+      - name: disruption_type
+        description: Disruption category.
+      - name: active_disruptions
+        description: Count of active disruptions that day.
+        data_tests: [not_null]
+      - name: prio_1_disruptions
+        description: How many of them have the highest priority (PRIO_1).

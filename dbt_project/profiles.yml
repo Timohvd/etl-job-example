@@ -1,0 +1,16 @@
+# Database connection used by dbt. Credentials come from environment variables, so no secrets live in this file.
+# dbt connects as the `dbt` role: it may read raw and build staging and production, nothing else
+# (see sql/init/00_bootstrap.sh). `elt_project` must match `profile:` in dbt_project.yml.
+elt_project:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DB_HOST', 'localhost') }}"
+      user: "{{ env_var('DBT_USER') }}"          # no default: dbt fails if it is missing
+      password: "{{ env_var('DBT_PASSWORD') }}"
+      port: 5432
+      dbname: "{{ env_var('DB_NAME') }}"
+      schema: staging                             # fallback schema; models override it via dbt_project.yml
+      threads: 4                                  # independent models run in parallel
+      keepalives_idle: 0
