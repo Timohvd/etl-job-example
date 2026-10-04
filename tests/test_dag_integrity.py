@@ -14,8 +14,8 @@ def dagbag(dags_folder):
 
 @pytest.fixture(scope="module")
 def dag(dagbag):
-    """The `elt_pipeline` DAG object."""
-    return dagbag.get_dag("elt_pipeline")
+    """The `elt_pipeline` DAG, read from memory (get_dag() would query Airflow's metadata database)."""
+    return dagbag.dags["elt_pipeline"]
 
 
 def test_no_import_errors(dagbag):
@@ -65,7 +65,7 @@ def test_run_level_safety_settings(dag):
 
 def test_monitor_dag_checks_freshness(dagbag):
     """The monitoring DAG exists, runs the freshness check, and alerts immediately on failure."""
-    monitor = dagbag.get_dag("pipeline_monitor")
+    monitor = dagbag.dags["pipeline_monitor"]
     task = monitor.get_task("dbt_source_freshness")
     assert "source freshness" in task.bash_command
     assert task.retries == 0 and task.on_failure_callback is not None
